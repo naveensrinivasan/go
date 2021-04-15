@@ -89,5 +89,5 @@ require (
 	gopkg.in/gavv/httpexpect.v1 v1.0.0-20170111145843-40724cf1e4a0
 	gopkg.in/gorp.v1 v1.7.1 // indirect
 	gopkg.in/square/go-jose.v2 v2.4.1
-	gopkg.in/tylerb/graceful.v1 v1.2.13
+	gopkg.in/tylerb/graceful.v1 v1.2.15
 )
