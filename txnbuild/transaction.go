@@ -28,7 +28,7 @@ import (
 	"github.com/stellar/go/xdr"
 )
 
-// MinBaseFee is the minimum transaction fee for the Stellar network.
+// MinBaseFee is the minimum transaction fee for the Stellar network of 100 stroops (0.00001 XLM).
 const MinBaseFee = 100
 
 // Account represents the aspects of a Stellar account necessary to construct transactions. See
@@ -73,6 +73,13 @@ func concatSignatures(
 		}
 		extended = append(extended, sig)
 	}
+	return extended, nil
+}
+
+func concatSignatureDecorated(e xdr.TransactionEnvelope, signatures []xdr.DecoratedSignature, newSignatures []xdr.DecoratedSignature) ([]xdr.DecoratedSignature, error) {
+	extended := make([]xdr.DecoratedSignature, len(signatures)+len(newSignatures))
+	copy(extended, signatures)
+	copy(extended[len(signatures):], newSignatures)
 	return extended, nil
 }
 
@@ -212,6 +219,11 @@ func (t *Transaction) SourceAccount() SimpleAccount {
 	return t.sourceAccount
 }
 
+// SequenceNumber returns the sequence number of the transaction.
+func (t *Transaction) SequenceNumber() int64 {
+	return t.sourceAccount.Sequence
+}
+
 // Memo returns the memo configured for this transaction.
 func (t *Transaction) Memo() Memo {
 	return t.memo
@@ -300,6 +312,17 @@ func (t *Transaction) SignHashX(preimage []byte) (*Transaction, error) {
 	return t.clone(extendedSignatures), nil
 }
 
+// AddSignatureDecorated returns a new Transaction instance which extends the current instance
+// with an additional decorated signature(s).
+func (t *Transaction) AddSignatureDecorated(signature ...xdr.DecoratedSignature) (*Transaction, error) {
+	extendedSignatures, err := concatSignatureDecorated(t.envelope, t.Signatures(), signature)
+	if err != nil {
+		return nil, err
+	}
+
+	return t.clone(extendedSignatures), nil
+}
+
 // AddSignatureBase64 returns a new Transaction instance which extends the current instance
 // with an additional signature derived from the given base64-encoded signature.
 func (t *Transaction) AddSignatureBase64(network, publicKey, signature string) (*Transaction, error) {
@@ -341,10 +364,14 @@ func (t *Transaction) ClaimableBalanceID(operationIndex int) (string, error) {
 
 	// We mimic the relevant code from Stellar Core
 	// https://github.com/stellar/stellar-core/blob/9f3cc04e6ec02c38974c42545a86cdc79809252b/src/test/TestAccount.cpp#L285
+	//
+	// Note that the source account must be *unmuxed* for this to work.
+	muxedAccountId := xdr.MustMuxedAddress(t.sourceAccount.AccountID).ToAccountId()
+	gAddress := muxedAccountId.Address()
 	operationId := xdr.OperationId{
 		Type: xdr.EnvelopeTypeEnvelopeTypeOpId,
 		Id: &xdr.OperationIdId{
-			SourceAccount: xdr.MustMuxedAddress(t.sourceAccount.AccountID),
+			SourceAccount: xdr.MustMuxedAddress(gAddress),
 			SeqNum:        xdr.SequenceNumber(t.sourceAccount.Sequence),
 			OpNum:         xdr.Uint32(operationIndex),
 		},
@@ -678,10 +705,8 @@ func NewTransaction(params TransactionParams) (*Transaction, error) {
 		sourceAccount = accountID.ToMuxedAccount()
 	}
 
-	if tx.baseFee < MinBaseFee {
-		return nil, errors.Errorf(
-			"base fee cannot be lower than network minimum of %d", MinBaseFee,
-		)
+	if tx.baseFee < 0 {
+		return nil, errors.Errorf("base fee cannot be negative")
 	}
 
 	if len(tx.operations) == 0 {

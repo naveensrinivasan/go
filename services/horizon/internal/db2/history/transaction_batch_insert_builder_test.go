@@ -75,7 +75,7 @@ func TestTransactionToMap_muxed(t *testing.T) {
 				},
 			},
 		},
-		Meta: xdr.TransactionMeta{
+		UnsafeMeta: xdr.TransactionMeta{
 			V:          1,
 			Operations: &[]xdr.OperationMeta{},
 			V1: &xdr.TransactionMetaV1{
@@ -90,4 +90,6 @@ func TestTransactionToMap_muxed(t *testing.T) {
 	assert.Equal(t, innerAccountID.Address(), row.Account)
 
 	assert.Equal(t, feeSourceAccountID.Address(), row.FeeAccount.String)
+
+	assert.Equal(t, feeSource.Address(), row.FeeAccountMuxed.String)
 }

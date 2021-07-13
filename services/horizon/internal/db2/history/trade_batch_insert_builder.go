@@ -1,6 +1,7 @@
 package history
 
 import (
+	"context"
 	"time"
 
 	"github.com/stellar/go/support/db"
@@ -27,13 +28,14 @@ type InsertTrade struct {
 // TradeBatchInsertBuilder is used to insert trades into the
 // history_trades table
 type TradeBatchInsertBuilder interface {
-	Add(entries ...InsertTrade) error
-	Exec() error
+	Add(ctx context.Context, entries ...InsertTrade) error
+	Exec(ctx context.Context) error
 }
 
 // tradeBatchInsertBuilder is a simple wrapper around db.BatchInsertBuilder
 type tradeBatchInsertBuilder struct {
 	builder db.BatchInsertBuilder
+	q       *Q
 }
 
 // NewTradeBatchInsertBuilder constructs a new TradeBatchInsertBuilder instance
@@ -43,16 +45,17 @@ func (q *Q) NewTradeBatchInsertBuilder(maxBatchSize int) TradeBatchInsertBuilder
 			Table:        q.GetTable("history_trades"),
 			MaxBatchSize: maxBatchSize,
 		},
+		q: q,
 	}
 }
 
 // Exec flushes all outstanding trades to the database
-func (i *tradeBatchInsertBuilder) Exec() error {
-	return i.builder.Exec()
+func (i *tradeBatchInsertBuilder) Exec(ctx context.Context) error {
+	return i.builder.Exec(ctx)
 }
 
 // Add adds a new trade to the batch
-func (i *tradeBatchInsertBuilder) Add(entries ...InsertTrade) error {
+func (i *tradeBatchInsertBuilder) Add(ctx context.Context, entries ...InsertTrade) error {
 	for _, entry := range entries {
 		sellOfferID := EncodeOfferId(uint64(entry.Trade.OfferId), CoreOfferIDType)
 
@@ -90,7 +93,7 @@ func (i *tradeBatchInsertBuilder) Add(entries ...InsertTrade) error {
 			entry.SellPrice.Invert()
 		}
 
-		err := i.builder.Row(map[string]interface{}{
+		err := i.builder.Row(ctx, map[string]interface{}{
 			"history_operation_id": entry.HistoryOperationID,
 			"\"order\"":            entry.Order,
 			"ledger_closed_at":     entry.LedgerCloseTime,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -e
+set -x
 
 source /etc/profile
 
@@ -14,7 +15,7 @@ if [ "$1" = "standalone" ]; then
   # start a network from scratch
   stellar-core force-scp
 
-  # initialze history archive for stand alone network
+  # initialize history archive for standalone network
   stellar-core new-hist vs
 
   # serve history archives to horizon on port 1570
@@ -23,4 +24,4 @@ if [ "$1" = "standalone" ]; then
   popd
 fi
 
-exec /init -- stellar-core run
+exec stellar-core run

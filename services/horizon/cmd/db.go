@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"go/types"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/stellar/go/services/horizon/internal/db2/history"
 
 	horizon "github.com/stellar/go/services/horizon/internal"
 	"github.com/stellar/go/services/horizon/internal/db2/schema"
@@ -23,6 +25,11 @@ import (
 var dbCmd = &cobra.Command{
 	Use:   "db [command]",
 	Short: "commands to manage horizon's postgres db",
+}
+
+var dbMigrateCmd = &cobra.Command{
+	Use:   "migrate [command]",
+	Short: "commands to run schema migrations on horizon's postgres db",
 }
 
 func requireAndSetFlag(name string) {
@@ -61,32 +68,84 @@ var dbInitCmd = &cobra.Command{
 	},
 }
 
-var dbMigrateCmd = &cobra.Command{
-	Use:   "migrate [up|down|redo] [COUNT]",
-	Short: "migrate schema",
-	Long:  "performs a schema migration command",
+func migrate(dir schema.MigrateDir, count int) {
+	dbConn, err := db.Open("postgres", config.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	numMigrationsRun, err := schema.Migrate(dbConn.DB.DB, dir, count)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if numMigrationsRun == 0 {
+		log.Println("No migrations applied.")
+	} else {
+		log.Printf("Successfully applied %d migrations.\n", numMigrationsRun)
+	}
+}
+
+var dbMigrateDownCmd = &cobra.Command{
+	Use:   "down COUNT",
+	Short: "run upwards db schema migrations",
+	Long:  "performs a downards schema migration command",
 	Run: func(cmd *cobra.Command, args []string) {
 		requireAndSetFlag(horizon.DatabaseURLFlagName)
 
-		// Allow invokations with 1 or 2 args.  All other args counts are erroneous.
-		if len(args) < 1 || len(args) > 2 {
+		// Only allow invokations with 1 args.
+		if len(args) != 1 {
 			cmd.Usage()
 			os.Exit(1)
 		}
 
-		dir := schema.MigrateDir(args[0])
-		count := 0
+		count, err := strconv.Atoi(args[0])
+		if err != nil {
+			log.Println(err)
+			cmd.Usage()
+			os.Exit(1)
+		}
 
-		// If a second arg is present, parse it to an int and use it as the count
-		// argument to the migration call.
-		if len(args) == 2 {
-			var err error
-			count, err = strconv.Atoi(args[1])
-			if err != nil {
-				log.Println(err)
-				cmd.Usage()
-				os.Exit(1)
-			}
+		migrate(schema.MigrateDown, count)
+	},
+}
+
+var dbMigrateRedoCmd = &cobra.Command{
+	Use:   "redo COUNT",
+	Short: "redo db schema migrations",
+	Long:  "performs a redo schema migration command",
+	Run: func(cmd *cobra.Command, args []string) {
+		requireAndSetFlag(horizon.DatabaseURLFlagName)
+
+		// Only allow invokations with 1 args.
+		if len(args) != 1 {
+			cmd.Usage()
+			os.Exit(1)
+		}
+
+		count, err := strconv.Atoi(args[0])
+		if err != nil {
+			log.Println(err)
+			cmd.Usage()
+			os.Exit(1)
+		}
+
+		migrate(schema.MigrateRedo, count)
+	},
+}
+
+var dbMigrateStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "print current database migration status",
+	Long:  "print current database migration status",
+	Run: func(cmd *cobra.Command, args []string) {
+		requireAndSetFlag(horizon.DatabaseURLFlagName)
+
+		// Only allow invokations with 0 args.
+		if len(args) != 0 {
+			fmt.Println(args)
+			cmd.Usage()
+			os.Exit(1)
 		}
 
 		dbConn, err := db.Open("postgres", config.DatabaseURL)
@@ -94,16 +153,40 @@ var dbMigrateCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 
-		numMigrationsRun, err := schema.Migrate(dbConn.DB.DB, dir, count)
+		status, err := schema.Status(dbConn.DB.DB)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		if numMigrationsRun == 0 {
-			log.Println("No migrations applied.")
-		} else {
-			log.Printf("Successfully applied %d migrations.\n", numMigrationsRun)
+		fmt.Println(status)
+	},
+}
+
+var dbMigrateUpCmd = &cobra.Command{
+	Use:   "up [COUNT]",
+	Short: "run upwards db schema migrations",
+	Long:  "performs an upwards schema migration command",
+	Run: func(cmd *cobra.Command, args []string) {
+		requireAndSetFlag(horizon.DatabaseURLFlagName)
+
+		// Only allow invokations with 0-1 args.
+		if len(args) > 1 {
+			cmd.Usage()
+			os.Exit(1)
 		}
+
+		count := 0
+		if len(args) == 1 {
+			var err error
+			count, err = strconv.Atoi(args[0])
+			if err != nil {
+				log.Println(err)
+				cmd.Usage()
+				os.Exit(1)
+			}
+		}
+
+		migrate(schema.MigrateUp, count)
 	},
 }
 
@@ -113,8 +196,9 @@ var dbReapCmd = &cobra.Command{
 	Long:  "reap removes any historical data that is earlier than the configured retention cutoff",
 	Run: func(cmd *cobra.Command, args []string) {
 		app := horizon.NewAppFromFlags(config, flags)
-		app.UpdateLedgerState()
-		err := app.DeleteUnretainedHistory()
+		ctx := context.Background()
+		app.UpdateLedgerState(ctx)
+		err := app.DeleteUnretainedHistory(ctx)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -200,16 +284,18 @@ var dbReingestRangeCmd = &cobra.Command{
 
 		argsUInt32 := make([]uint32, 2)
 		for i, arg := range args {
-			seq, err := strconv.Atoi(arg)
-			if err != nil {
+			if seq, err := strconv.Atoi(arg); err != nil {
 				cmd.Usage()
 				log.Fatalf(`Invalid sequence number "%s"`, arg)
+			} else if seq < 0 {
+				log.Fatalf("sequence number %s cannot be negative", arg)
+			} else {
+				argsUInt32[i] = uint32(seq)
 			}
-			argsUInt32[i] = uint32(seq)
 		}
 
-		horizon.ApplyFlags(config, flags)
-		err := RunDBReingestRange(argsUInt32[0], argsUInt32[1], reingestForce, parallelWorkers, *config)
+		horizon.ApplyFlags(config, flags, horizon.ApplyOptions{RequireCaptiveCoreConfig: false, AlwaysIngest: true})
+		err := runDBReingestRange(argsUInt32[0], argsUInt32[1], reingestForce, parallelWorkers, *config)
 		if err != nil {
 			if errors.Cause(err) == ingest.ErrReingestRangeConflict {
 				message := `
@@ -230,7 +316,7 @@ var dbReingestRangeCmd = &cobra.Command{
 	},
 }
 
-func RunDBReingestRange(from, to uint32, reingestForce bool, parallelWorkers uint, config horizon.Config) error {
+func runDBReingestRange(from, to uint32, reingestForce bool, parallelWorkers uint, config horizon.Config) error {
 	if reingestForce && parallelWorkers > 1 {
 		return errors.New("--force is incompatible with --parallel-workers > 1")
 	}
@@ -249,7 +335,10 @@ func RunDBReingestRange(from, to uint32, reingestForce bool, parallelWorkers uin
 		EnableCaptiveCore:           config.EnableCaptiveCoreIngestion,
 		CaptiveCoreBinaryPath:       config.CaptiveCoreBinaryPath,
 		RemoteCaptiveCoreURL:        config.RemoteCaptiveCoreURL,
-		CaptiveCoreConfigAppendPath: config.CaptiveCoreConfigAppendPath,
+		CaptiveCoreToml:             config.CaptiveCoreToml,
+		CaptiveCoreStoragePath:      config.CaptiveCoreStoragePath,
+		StellarCoreCursor:           config.CursorName,
+		StellarCoreURL:              config.StellarCoreURL,
 	}
 
 	if !ingestConfig.EnableCaptiveCore {
@@ -288,6 +377,41 @@ func RunDBReingestRange(from, to uint32, reingestForce bool, parallelWorkers uin
 	)
 }
 
+var dbDetectGapsCmd = &cobra.Command{
+	Use:   "detect-gaps",
+	Short: "detects ingestion gaps in Horizon's database",
+	Long:  "detects ingestion gaps in Horizon's database and prints a list of reingest commands needed to fill the gaps",
+	Run: func(cmd *cobra.Command, args []string) {
+		requireAndSetFlag(horizon.DatabaseURLFlagName)
+		if len(args) != 0 {
+			cmd.Usage()
+			os.Exit(1)
+		}
+		gaps, err := runDBDetectGaps(*config)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(gaps) == 0 {
+			hlog.Info("No gaps found")
+			return
+		}
+		fmt.Println("Horizon commands to run in order to fill in the gaps:")
+		cmdname := os.Args[0]
+		for _, g := range gaps {
+			fmt.Printf("%s db reingest %d %d\n", cmdname, g.StartSequence, g.EndSequence)
+		}
+	},
+}
+
+func runDBDetectGaps(config horizon.Config) ([]history.LedgerGap, error) {
+	horizonSession, err := db.Open("postgres", config.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	q := &history.Q{horizonSession}
+	return q.GetLedgerGaps(context.Background())
+}
+
 func init() {
 	for _, co := range reingestRangeCmdOpts {
 		err := co.Init(dbReingestRangeCmd)
@@ -298,12 +422,19 @@ func init() {
 
 	viper.BindPFlags(dbReingestRangeCmd.PersistentFlags())
 
-	rootCmd.AddCommand(dbCmd)
+	RootCmd.AddCommand(dbCmd)
 	dbCmd.AddCommand(
 		dbInitCmd,
 		dbMigrateCmd,
 		dbReapCmd,
 		dbReingestCmd,
+		dbDetectGapsCmd,
+	)
+	dbMigrateCmd.AddCommand(
+		dbMigrateDownCmd,
+		dbMigrateRedoCmd,
+		dbMigrateStatusCmd,
+		dbMigrateUpCmd,
 	)
 	dbReingestCmd.AddCommand(dbReingestRangeCmd)
 }

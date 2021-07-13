@@ -4,6 +4,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/stellar/go/ingest/ledgerbackend"
+
 	"github.com/sirupsen/logrus"
 	"github.com/stellar/throttled"
 )
@@ -12,18 +14,19 @@ import (
 // app's main function and is provided to NewApp.
 type Config struct {
 	DatabaseURL        string
+	RoDatabaseURL      string
 	HistoryArchiveURLs []string
 	Port               uint
 	AdminPort          uint
 
 	EnableCaptiveCoreIngestion  bool
 	CaptiveCoreBinaryPath       string
-	CaptiveCoreConfigAppendPath string
 	RemoteCaptiveCoreURL        string
-	CaptiveCoreHTTPPort         uint
-	CaptiveCorePeerPort         uint
-	CaptiveCoreLogPath          string
+	CaptiveCoreConfigPath       string
+	CaptiveCoreTomlParams       ledgerbackend.CaptiveCoreTomlParams
+	CaptiveCoreToml             *ledgerbackend.CaptiveCoreToml
 	CaptiveCoreStoragePath      string
+	CaptiveCoreReuseStoragePath bool
 
 	StellarCoreDatabaseURL string
 	StellarCoreURL         string

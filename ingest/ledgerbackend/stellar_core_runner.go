@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -49,28 +50,24 @@ type pipe struct {
 }
 
 type stellarCoreRunner struct {
-	logPath           string
-	executablePath    string
-	configAppendPath  string
-	networkPassphrase string
-	historyURLs       []string
-	httpPort          uint
-	peerPort          uint
-	mode              stellarCoreRunnerMode
+	executablePath string
 
 	started      bool
+	cmd          *exec.Cmd
 	wg           sync.WaitGroup
 	ctx          context.Context
 	cancel       context.CancelFunc
 	ledgerBuffer *bufferedLedgerMetaReader
 	pipe         pipe
+	mode         stellarCoreRunnerMode
 
 	lock             sync.Mutex
 	processExited    bool
 	processExitError error
 
-	storagePath string
-	nonce       string
+	storagePath      string
+	reuseStoragePath bool
+	nonce            string
 
 	log *log.Entry
 }
@@ -85,14 +82,25 @@ func createRandomHexString(n int) string {
 }
 
 func newStellarCoreRunner(config CaptiveCoreConfig, mode stellarCoreRunnerMode) (*stellarCoreRunner, error) {
-	// Use the specified directory to store Captive Core's data:
-	//    https://github.com/stellar/go/issues/3437
-	//
-	// However, first we ALWAYS append something to the base storage path,
-	// because we will delete the directory entirely when Horizon stops. We also
-	// add a random suffix in order to ensure that there aren't naming
-	// conflicts.
-	fullStoragePath := path.Join(config.StoragePath, "captive-core-"+createRandomHexString(8))
+	var fullStoragePath string
+	if runtime.GOOS == "windows" || mode == stellarCoreRunnerModeOffline || !config.ReuseStoragePath {
+		// On Windows, first we ALWAYS append something to the base storage path,
+		// because we will delete the directory entirely when Horizon stops. We also
+		// add a random suffix in order to ensure that there aren't naming
+		// conflicts.
+		// This is done because it's impossible to send SIGINT on Windows so
+		// buckets can become corrupted.
+		// We also want to use random directories in offline mode (reingestion)
+		// because it's possible it's running multiple Stellar-Cores on a single
+		// machine.
+		fullStoragePath = path.Join(config.StoragePath, "captive-core-"+createRandomHexString(8))
+	} else {
+		// Use the specified directory to store Captive Core's data:
+		//    https://github.com/stellar/go/issues/3437
+		// but be sure to re-use rather than replace it:
+		//    https://github.com/stellar/go/issues/3631
+		fullStoragePath = path.Join(config.StoragePath, "captive-core")
+	}
 
 	info, err := os.Stat(fullStoragePath)
 	if os.IsNotExist(err) {
@@ -102,8 +110,7 @@ func newStellarCoreRunner(config CaptiveCoreConfig, mode stellarCoreRunnerMode) 
 				"failed to create storage directory (%s)", fullStoragePath))
 		}
 	} else if !info.IsDir() {
-		return nil, errors.New(fmt.Sprintf(
-			"%s is not a directory", fullStoragePath))
+		return nil, errors.New(fmt.Sprintf("%s is not a directory", fullStoragePath))
 	} else if err != nil {
 		return nil, errors.Wrap(err, fmt.Sprintf(
 			"error accessing storage directory: %s", fullStoragePath))
@@ -112,17 +119,12 @@ func newStellarCoreRunner(config CaptiveCoreConfig, mode stellarCoreRunnerMode) 
 	ctx, cancel := context.WithCancel(config.Context)
 
 	runner := &stellarCoreRunner{
-		logPath:           config.LogPath,
-		executablePath:    config.BinaryPath,
-		configAppendPath:  config.ConfigAppendPath,
-		networkPassphrase: config.NetworkPassphrase,
-		historyURLs:       config.HistoryArchiveURLs,
-		httpPort:          config.HTTPPort,
-		peerPort:          config.PeerPort,
-		mode:              mode,
-		ctx:               ctx,
-		cancel:            cancel,
-		storagePath:       fullStoragePath,
+		executablePath:   config.BinaryPath,
+		ctx:              ctx,
+		cancel:           cancel,
+		storagePath:      fullStoragePath,
+		reuseStoragePath: config.ReuseStoragePath,
+		mode:             mode,
 		nonce: fmt.Sprintf(
 			"captive-stellar-core-%x",
 			rand.New(rand.NewSource(time.Now().UnixNano())).Uint64(),
@@ -130,66 +132,42 @@ func newStellarCoreRunner(config CaptiveCoreConfig, mode stellarCoreRunnerMode) 
 		log: config.Log,
 	}
 
-	if err := runner.writeConf(); err != nil {
+	if conf, err := writeConf(config.Toml, mode, runner.getConfFileName()); err != nil {
 		return nil, errors.Wrap(err, "error writing configuration")
+	} else {
+		runner.log.Debugf("captive core config file contents:\n%s", conf)
 	}
 
 	return runner, nil
 }
 
-func (r *stellarCoreRunner) generateConfig() (string, error) {
-	if r.mode == stellarCoreRunnerModeOnline && r.configAppendPath == "" {
-		return "", errors.New("stellar-core append config file path cannot be empty in online mode")
+func writeConf(captiveCoreToml *CaptiveCoreToml, mode stellarCoreRunnerMode, location string) (string, error) {
+	text, err := generateConfig(captiveCoreToml, mode)
+	if err != nil {
+		return "", err
 	}
 
-	lines := []string{
-		"# Generated file -- do not edit",
-		"NODE_IS_VALIDATOR=false",
-		"DISABLE_XDR_FSYNC=true",
-		fmt.Sprintf(`NETWORK_PASSPHRASE="%s"`, r.networkPassphrase),
-		// Note: We don't pass BUCKET_DIR_PATH here because it's created
-		// *relative* to the storage path (i.e. where the config lives).
-		fmt.Sprintf(`HTTP_PORT=%d`, r.httpPort),
-		fmt.Sprintf(`LOG_FILE_PATH="%s"`, r.logPath),
-	}
+	return string(text), ioutil.WriteFile(location, text, 0644)
+}
 
-	if r.peerPort > 0 {
-		lines = append(lines, fmt.Sprintf(`PEER_PORT=%d`, r.peerPort))
-	}
-
-	if r.mode == stellarCoreRunnerModeOffline {
-		// In offline mode, there is no need to connect to peers
-		lines = append(lines, "RUN_STANDALONE=true")
-		// We don't need consensus when catching up
-		lines = append(lines, "UNSAFE_QUORUM=true")
-	}
-
-	if r.mode == stellarCoreRunnerModeOffline && r.configAppendPath == "" {
-		// Add a fictional quorum -- necessary to convince core to start up;
-		// but not used at all for our purposes. Pubkey here is just random.
-		lines = append(lines,
-			"[QUORUM_SET]",
-			"THRESHOLD_PERCENT=100",
-			`VALIDATORS=["GCZBOIAY4HLKAJVNJORXZOZRAY2BJDBZHKPBHZCRAIUR5IHC2UHBGCQR"]`)
-	}
-
-	result := strings.ReplaceAll(strings.Join(lines, "\n"), `\`, `\\`) + "\n\n"
-	if r.configAppendPath != "" {
-		appendConfigContents, err := ioutil.ReadFile(r.configAppendPath)
+func generateConfig(captiveCoreToml *CaptiveCoreToml, mode stellarCoreRunnerMode) ([]byte, error) {
+	if mode == stellarCoreRunnerModeOffline {
+		var err error
+		captiveCoreToml, err = captiveCoreToml.CatchupToml()
 		if err != nil {
-			return "", errors.Wrap(err, "reading quorum config file")
+			return nil, errors.Wrap(err, "could not generate catch up config")
 		}
-		result += string(appendConfigContents) + "\n\n"
 	}
 
-	lines = []string{}
-	for i, val := range r.historyURLs {
-		lines = append(lines, fmt.Sprintf("[HISTORY.h%d]", i))
-		lines = append(lines, fmt.Sprintf(`get="curl -sf %s/{0} -o {1}"`, val))
+	if !captiveCoreToml.QuorumSetIsConfigured() {
+		return nil, errors.New("stellar-core append config file does not define any quorum set")
 	}
-	result += strings.Join(lines, "\n")
 
-	return result, nil
+	text, err := captiveCoreToml.Marshal()
+	if err != nil {
+		return nil, errors.Wrap(err, "could not marshal captive core config")
+	}
+	return text, nil
 }
 
 func (r *stellarCoreRunner) getConfFileName() string {
@@ -240,13 +218,14 @@ func (r *stellarCoreRunner) getLogLineWriter() io.Writer {
 					"ERROR":   r.log.Errorf,
 					"WARNING": r.log.Warnf,
 					"INFO":    r.log.Infof,
+					"DEBUG":   r.log.Debugf,
 				}
 
-				if writer, ok := levelMapping[strings.ToUpper(level)]; ok {
-					writer("%s: %s", category, line)
-				} else {
-					r.log.Info(line)
+				writer := r.log.Infof
+				if f, ok := levelMapping[strings.ToUpper(level)]; ok {
+					writer = f
 				}
+				writer("%s: %s", category, line)
 			} else {
 				r.log.Info(line)
 			}
@@ -255,20 +234,9 @@ func (r *stellarCoreRunner) getLogLineWriter() io.Writer {
 	return wr
 }
 
-// Makes the temp directory and writes the config file to it; called by the
-// platform-specific captiveStellarCore.Start() methods.
-func (r *stellarCoreRunner) writeConf() error {
-	conf, err := r.generateConfig()
-	if err != nil {
-		return err
-	}
-	r.log.Debugf("captive core config file contents:\n%s", conf)
-	return ioutil.WriteFile(r.getConfFileName(), []byte(conf), 0644)
-}
-
 func (r *stellarCoreRunner) createCmd(params ...string) *exec.Cmd {
 	allParams := append([]string{"--conf", r.getConfFileName()}, params...)
-	cmd := exec.CommandContext(r.ctx, r.executablePath, allParams...)
+	cmd := exec.Command(r.executablePath, allParams...)
 	cmd.Dir = r.storagePath
 	cmd.Stdout = r.getLogLineWriter()
 	cmd.Stderr = r.getLogLineWriter()
@@ -312,24 +280,31 @@ func (r *stellarCoreRunner) catchup(from, to uint32) error {
 	}
 
 	rangeArg := fmt.Sprintf("%d/%d", to, to-from+1)
-	cmd := r.createCmd(
+	r.cmd = r.createCmd(
 		"catchup", rangeArg,
 		"--metadata-output-stream", r.getPipeName(),
-		"--replay-in-memory",
+		"--in-memory",
 	)
 
 	var err error
-	r.pipe, err = r.start(cmd)
+	r.pipe, err = r.start(r.cmd)
 	if err != nil {
-		r.closeLogLineWriters(cmd)
+		r.closeLogLineWriters(r.cmd)
 		return errors.Wrap(err, "error starting `stellar-core catchup` subprocess")
 	}
 
 	r.started = true
 	r.ledgerBuffer = newBufferedLedgerMetaReader(r.pipe.Reader)
 	go r.ledgerBuffer.start()
+
+	if binaryWatcher, err := newFileWatcher(r); err != nil {
+		r.log.Warnf("could not create captive core binary watcher: %v", err)
+	} else {
+		go binaryWatcher.loop()
+	}
+
 	r.wg.Add(1)
-	go r.handleExit(cmd)
+	go r.handleExit()
 
 	return nil
 }
@@ -348,7 +323,7 @@ func (r *stellarCoreRunner) runFrom(from uint32, hash string) error {
 		return errors.New("runner already started")
 	}
 
-	cmd := r.createCmd(
+	r.cmd = r.createCmd(
 		"run",
 		"--in-memory",
 		"--start-at-ledger", fmt.Sprintf("%d", from),
@@ -357,25 +332,80 @@ func (r *stellarCoreRunner) runFrom(from uint32, hash string) error {
 	)
 
 	var err error
-	r.pipe, err = r.start(cmd)
+	r.pipe, err = r.start(r.cmd)
 	if err != nil {
-		r.closeLogLineWriters(cmd)
+		r.closeLogLineWriters(r.cmd)
 		return errors.Wrap(err, "error starting `stellar-core run` subprocess")
 	}
 
 	r.started = true
 	r.ledgerBuffer = newBufferedLedgerMetaReader(r.pipe.Reader)
 	go r.ledgerBuffer.start()
+
+	if binaryWatcher, err := newFileWatcher(r); err != nil {
+		r.log.Warnf("could not create captive core binary watcher: %v", err)
+	} else {
+		go binaryWatcher.loop()
+	}
+
 	r.wg.Add(1)
-	go r.handleExit(cmd)
+	go r.handleExit()
 
 	return nil
 }
 
-func (r *stellarCoreRunner) handleExit(cmd *exec.Cmd) {
+func (r *stellarCoreRunner) handleExit() {
 	defer r.wg.Done()
-	exitErr := cmd.Wait()
-	r.closeLogLineWriters(cmd)
+
+	// Pattern recommended in:
+	// https://github.com/golang/go/blob/cacac8bdc5c93e7bc71df71981fdf32dded017bf/src/cmd/go/script_test.go#L1091-L1098
+	var interrupt os.Signal = os.Interrupt
+	if runtime.GOOS == "windows" {
+		// Per https://golang.org/pkg/os/#Signal, “Interrupt is not implemented on
+		// Windows; using it with os.Process.Signal will return an error.”
+		// Fall back to Kill instead.
+		interrupt = os.Kill
+	}
+
+	errc := make(chan error)
+	go func() {
+		select {
+		case errc <- nil:
+			return
+		case <-r.ctx.Done():
+		}
+
+		err := r.cmd.Process.Signal(interrupt)
+		if err == nil {
+			err = r.ctx.Err() // Report ctx.Err() as the reason we interrupted.
+		} else if err.Error() == "os: process already finished" {
+			errc <- nil
+			return
+		}
+
+		timer := time.NewTimer(10 * time.Second)
+		select {
+		// Report ctx.Err() as the reason we interrupted the process...
+		case errc <- r.ctx.Err():
+			timer.Stop()
+			return
+		// ...but after killDelay has elapsed, fall back to a stronger signal.
+		case <-timer.C:
+		}
+
+		// Wait still hasn't returned.
+		// Kill the process harder to make sure that it exits.
+		//
+		// Ignore any error: if cmd.Process has already terminated, we still
+		// want to send ctx.Err() (or the error from the Interrupt call)
+		// to properly attribute the signal that may have terminated it.
+		_ = r.cmd.Process.Kill()
+
+		errc <- err
+	}()
+
+	waitErr := r.cmd.Wait()
+	r.closeLogLineWriters(r.cmd)
 
 	r.lock.Lock()
 	defer r.lock.Unlock()
@@ -388,7 +418,11 @@ func (r *stellarCoreRunner) handleExit(cmd *exec.Cmd) {
 	}
 
 	r.processExited = true
-	r.processExitError = exitErr
+	if interruptErr := <-errc; interruptErr != nil {
+		r.processExitError = interruptErr
+	} else {
+		r.processExitError = waitErr
+	}
 }
 
 // closeLogLineWriters closes the go routines created by getLogLineWriter()
@@ -446,5 +480,17 @@ func (r *stellarCoreRunner) close() error {
 		r.pipe.Reader.Close()
 	}
 
-	return os.RemoveAll(storagePath)
+	if runtime.GOOS == "windows" ||
+		(r.processExitError != nil && r.processExitError != context.Canceled) ||
+		r.mode == stellarCoreRunnerModeOffline ||
+		!r.reuseStoragePath {
+		// It's impossible to send SIGINT on Windows so buckets can become
+		// corrupted. If we can't reuse it, then remove it.
+		// We also remove the storage path if there was an error terminating the
+		// process (files can be corrupted).
+		// We remove all files when reingesting to save disk space.
+		return os.RemoveAll(storagePath)
+	}
+
+	return nil
 }
